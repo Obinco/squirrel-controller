@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Squirrel Car — Phone Controller</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;touch-action:none}html,body{margin:0;width:100%;height:100%;overflow:hidden;overscroll-behavior:none;background:#e5f3ef;color:#203a3b;font:16px system-ui,sans-serif}body{display:flex;justify-content:center;align-items:stretch}main{width:min(520px,100%);height:100dvh;padding:calc(env(safe-area-inset-top) + 14px) 16px calc(env(safe-area-inset-bottom) + 14px);display:flex;flex-direction:column;gap:12px}h1{font-size:23px;margin:0;text-align:center}label{font-size:13px;font-weight:800}input,select{width:100%;font-size:21px;padding:12px;border:2px solid #8daca4;border-radius:10px;background:white;color:#142d2f;touch-action:manipulation}#join{background:#296a68;color:#fff;border:0;border-radius:12px;padding:14px;font:bold 18px system-ui;touch-action:manipulation}#status{font-size:14px;text-align:center;min-height:22px}#setup{display:grid;gap:9px}#controls{display:none;flex:1;min-height:0}#controls.ready{display:flex}#touchGrid{display:grid;grid-template-columns:repeat(2,1fr);gap:13px;flex:1;width:100%}.touchBtn{user-select:none;-webkit-user-select:none;border:3px solid #32585b;border-radius:24px;background:#f2b47e;color:#153c3d;font:900 clamp(22px,8vw,42px) system-ui;touch-action:none;min-height:110px;box-shadow:0 7px 0 #9d694f;display:flex;align-items:center;justify-content:center;text-align:center}.touchBtn.down{background:#ffd56c;transform:translateY(5px);box-shadow:0 2px 0 #9d694f}.touchBtn.single{grid-column:1/-1}#disconnect{font:700 15px system-ui;padding:9px;border:1px solid #b7c5ba;background:#f8fffc;border-radius:10px;touch-action:manipulation}#roleLabel{font-weight:800;text-align:center}#setup[hidden]{display:none}small{font-size:12px;text-align:center;color:#496663}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js" defer></script>
+</head>
+<body>
+<main>
+  <h1>🐿️ Squirrel Car Controller</h1>
+  <div id="setup">
+    <label for="room">Room code</label><input id="room" maxlength="6" inputmode="text" autocomplete="off" autocapitalize="characters" placeholder="ABC234">
+    <label for="role">Squirrel role</label><select id="role"><option value="steer">Steer</option><option value="pedals">Pedals</option><option value="boost">Boost</option><option value="horn">Horn</option></select>
+    <button id="join" type="button">Connect</button>
+  </div>
+  <div id="roleLabel" hidden></div>
+  <div id="controls"><div id="touchGrid"></div></div>
+  <div id="status" role="status">Enter the code shown on the game.</div>
+  <button id="disconnect" type="button" hidden>Disconnect</button>
+  <small>Hold buttons to control your squirrel. Keep this page open.</small>
+</main>
+<script>
+// Separate phone-only page: no Three.js, assets, or game physics.
+const $=id=>document.getElementById(id);
+const queryRoom=new URLSearchParams(location.search).get('room');
+if(queryRoom)$('room').value=queryRoom.toUpperCase().replace(/[^A-Z2-9]/g,'').slice(0,6);
+let peer=null,conn=null,selectedRole='',held=new Set(),timer=null,lastSendAt=0;
+const VALID_ROLES=['steer','pedals','boost','horn'];
+function status(s){$('status').textContent=s;}
+function currentState(){
+  return {type:'state',role:selectedRole,steer:(held.has('right')?1:0)-(held.has('left')?1:0),
+    throttle:held.has('gas')?1:0,brakeReverse:held.has('reverse')?1:0,
+    pressed:held.has(selectedRole==='boost'?'boost':'horn')};
+}
+function sendState(){if(conn?.open){try{conn.send(currentState());lastSendAt=performance.now();}catch{}}}
+function clearTouches(){held.clear();document.querySelectorAll('.touchBtn').forEach(b=>b.classList.remove('down'));sendState();}
+function closeConnection(){
+  clearTouches();if(timer)clearInterval(timer);timer=null;
+  try{conn?.close();}catch{}try{peer?.destroy();}catch{}conn=null;peer=null;
+  $('controls').classList.remove('ready');$('setup').hidden=false;
+  $('disconnect').hidden=true;$('roleLabel').hidden=true;status('Disconnected. Enter code to reconnect.');
+}
+function addButton(text,key,single=false){
+  const b=document.createElement('div');b.className='touchBtn'+(single?' single':'');b.textContent=text;
+  // Pointer events cover touch and mouse; every finger has its own pointer ID.
+  const activePointers=new Set();
+  const down=e=>{e.preventDefault();if(!conn?.open)return;activePointers.add(e.pointerId);try{b.setPointerCapture(e.pointerId);}catch{}held.add(key);b.classList.add('down');sendState();};
+  const up=e=>{e.preventDefault();activePointers.delete(e.pointerId);if(!activePointers.size){held.delete(key);b.classList.remove('down');sendState();}};
+  b.addEventListener('pointerdown',down);b.addEventListener('pointerup',up);b.addEventListener('pointercancel',up);b.addEventListener('lostpointercapture',up);
+  $('touchGrid').append(b);
+}
+function showControls(){
+  $('setup').hidden=true;$('disconnect').hidden=false;$('roleLabel').hidden=false;
+  $('roleLabel').textContent=selectedRole.toUpperCase();$('touchGrid').replaceChildren();
+  if(selectedRole==='steer'){addButton('◀ LEFT','left');addButton('RIGHT ▶','right');}
+  if(selectedRole==='pedals'){addButton('↑ GAS','gas');addButton('↓ REVERSE','reverse');}
+  if(selectedRole==='boost')addButton('⚡ BOOST','boost',true);
+  if(selectedRole==='horn')addButton('📣 HONK','horn',true);
+  $('controls').classList.add('ready');
+  // Also send when idle: host releases inputs if heartbeats stop for >1.7 s.
+  timer=setInterval(sendState,100);sendState();
+}
+$('join').addEventListener('click',()=>{
+  if(peer){closeConnection();}
+  const room=$('room').value.toUpperCase().trim();selectedRole=$('role').value;
+  if(!/^[A-HJ-NP-Z2-9]{6}$/.test(room)||!VALID_ROLES.includes(selectedRole)){status('Enter a valid six-character room code.');return;}
+  if(typeof window.Peer!=='function'){status('PeerJS could not load. Check phone internet.');return;}
+  status('Connecting…');$('join').disabled=true;
+  try{
+    peer=new Peer(undefined,{debug:0});
+    peer.on('open',()=>{
+      conn=peer.connect('squirrelcar-j-'+room.toLowerCase(),{reliable:true,serialization:'json'});
+      conn.on('open',()=>{status('Connected · choosing role…');conn.send({type:'hello',role:selectedRole});});
+      conn.on('data',data=>{
+        if(data?.type==='accepted'&&data.role===selectedRole){showControls();status('Connected');}
+        if(data?.type==='ping'&&conn?.open)conn.send({type:'pong',seq:data.seq});
+      });
+      conn.on('close',()=>{closeConnection();});
+      conn.on('error',()=>{closeConnection();status('Connection failed. Check the room code and network.');});
+    });
+    peer.on('error',e=>{closeConnection();status('Connection error: '+(e?.type||'network'));});
+  }catch(e){closeConnection();status('Unable to connect: '+e.message);}
+  finally{$('join').disabled=false;}
+});
+$('disconnect').addEventListener('click',closeConnection);
+addEventListener('blur',clearTouches);
+addEventListener('pagehide',closeConnection);
+addEventListener('contextmenu',e=>e.preventDefault());
+addEventListener('touchmove',e=>e.preventDefault(),{passive:false});
+</script>
+</body>
+</html>
