@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Squirrel Car — Four-Role Controller</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;touch-action:none}html,body{margin:0;width:100%;height:100%;overflow:hidden;overscroll-behavior:none;background:#e5f3ef;color:#203a3b;font:16px system-ui,sans-serif}body{display:flex;justify-content:center;align-items:stretch}main{width:min(520px,100%);height:100dvh;padding:calc(env(safe-area-inset-top) + 14px) 16px calc(env(safe-area-inset-bottom) + 14px);display:flex;flex-direction:column;gap:12px}h1{font-size:23px;margin:0;text-align:center}label{font-size:13px;font-weight:800}input,select{width:100%;font-size:21px;padding:12px;border:2px solid #8daca4;border-radius:10px;background:white;color:#142d2f;touch-action:manipulation}#join{background:#296a68;color:#fff;border:0;border-radius:12px;padding:14px;font:bold 18px system-ui;touch-action:manipulation}#status{font-size:14px;text-align:center;min-height:22px}#setup{display:grid;gap:9px}#controls{display:none;flex:1;min-height:0}#controls.ready{display:flex}#touchGrid{display:grid;grid-template-columns:repeat(2,1fr);gap:13px;flex:1;width:100%}.touchBtn{user-select:none;-webkit-user-select:none;border:3px solid #32585b;border-radius:24px;background:#f2b47e;color:#153c3d;font:900 clamp(22px,8vw,42px) system-ui;touch-action:none;min-height:110px;box-shadow:0 7px 0 #9d694f;display:flex;align-items:center;justify-content:center;text-align:center}.touchBtn.down{background:#ffd56c;transform:translateY(5px);box-shadow:0 2px 0 #9d694f}.touchBtn.single{grid-column:1/-1}#disconnect{font:700 15px system-ui;padding:9px;border:1px solid #b7c5ba;background:#f8fffc;border-radius:10px;touch-action:manipulation}#roleLabel{font-weight:800;text-align:center}#setup[hidden]{display:none}#roleAvailability{font-size:12px;color:#426363;line-height:1.4}option:disabled{color:#999;background:#eee}small{font-size:12px;text-align:center;color:#496663}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js" defer></script>
+</head>
+<body>
+<main>
+  <h1>🐿️ Squirrel Car Controller</h1>
+  <div id="setup">
+    <label for="room">Room code</label><input id="room" maxlength="6" inputmode="text" autocomplete="off" autocapitalize="characters" placeholder="ABC234">
+    <label for="role">Squirrel role</label><select id="role"><option value="steer">Steer</option><option value="pedals">Pedals</option><option value="boost">Boost</option><option value="horn">Horn</option></select>
+    <div id="roleAvailability" aria-live="polite">Connect to check which roles are free.</div>
+    <button id="join" type="button">Connect</button>
+  </div>
+  <div id="roleLabel" hidden></div>
+  <div id="controls"><div id="touchGrid"></div></div>
+  <div id="status" role="status">Enter the code shown on the game.</div>
+  <button id="disconnect" type="button" hidden>Disconnect</button>
+  <small>Hold buttons to control your squirrel. Keep this page open.</small>
+</main>
+<script>
+// Batch K controller: only touch/pointer input and PeerJS. No game code.
+const $=id=>document.getElementById(id);
+const VALID_ROLES=['steer','pedals','boost','horn'];
+const ROLE_NAMES={steer:'Steer',pedals:'Pedals',boost:'Boost',horn:'Horn'};
+const queryRoom=new URLSearchParams(location.search).get('room');
+if(queryRoom)$('room').value=queryRoom.toUpperCase().replace(/[^A-Z2-9]/g,'').slice(0,6);
+let peer=null,conn=null,selectedRole='',connectedRoom='',held=new Set(),timer=null;
+let roleAvailability=null,claimPending=false,owned=false,connecting=false;
+function status(s){$('status').textContent=s;}
+function updateAvailability(roles){
+  if(!roles||typeof roles!=='object')return;
+  roleAvailability=roles;
+  const parts=[];
+  for(const role of VALID_ROLES){
+    const free=roles[role]===true;
+    const option=$('role').querySelector(`option[value="${role}"]`);
+    option.disabled=!free;
+    option.textContent=ROLE_NAMES[role]+(free?' · FREE':' · TAKEN');
+    parts.push(`${ROLE_NAMES[role]}: ${free?'free':'taken'}`);
+  }
+  $('roleAvailability').textContent=parts.join(' · ');
+  // Do NOT auto-assign a free role or silently swap the chosen role.
+}
+function currentState(){
+  return {type:'state',role:selectedRole,
+    steer:(held.has('left')?1:0)-(held.has('right')?1:0), // Preserve Batch J v3 steering directions.
+    throttle:held.has('gas')?1:0,brakeReverse:held.has('reverse')?1:0,
+    pressed:held.has(selectedRole==='boost'?'boost':'horn')};
+}
+function sendState(){if(owned&&conn?.open){try{conn.send(currentState());}catch{}}}
+function clearTouches(){
+  held.clear();document.querySelectorAll('.touchBtn').forEach(b=>b.classList.remove('down'));
+  sendState();
+}
+function stopTimer(){if(timer!==null){clearInterval(timer);timer=null;}}
+function closeConnection(){
+  clearTouches();stopTimer();owned=false;claimPending=false;connecting=false;
+  const oldConn=conn,oldPeer=peer;conn=null;peer=null;connectedRoom='';
+  try{oldConn?.close();}catch{}try{oldPeer?.destroy();}catch{}
+  $('controls').classList.remove('ready');$('setup').hidden=false;
+  $('disconnect').hidden=true;$('roleLabel').hidden=true;
+  $('join').disabled=false;$('join').textContent='Connect';
+  roleAvailability=null;
+  for(const option of $('role').options){option.disabled=false;option.textContent=ROLE_NAMES[option.value];}
+  $('roleAvailability').textContent='Connect to check which roles are free.';
+  status('Disconnected. Enter the room code to reconnect.');
+}
+function addButton(text,key,single=false){
+  const b=document.createElement('div');b.className='touchBtn'+(single?' single':'');b.textContent=text;
+  const activePointers=new Set();
+  const down=e=>{
+    e.preventDefault();if(!owned||!conn?.open)return;
+    activePointers.add(e.pointerId);try{b.setPointerCapture(e.pointerId);}catch{}
+    held.add(key);b.classList.add('down');sendState();
+  };
+  const up=e=>{
+    e.preventDefault();activePointers.delete(e.pointerId);
+    if(!activePointers.size){held.delete(key);b.classList.remove('down');sendState();}
+  };
+  b.addEventListener('pointerdown',down);b.addEventListener('pointerup',up);
+  b.addEventListener('pointercancel',up);b.addEventListener('lostpointercapture',up);
+  // Keep the validated Batch J v3 protection against double-tap zoom on phones.
+  b.addEventListener('touchstart',e=>e.preventDefault(),{passive:false});
+  b.addEventListener('touchend',e=>e.preventDefault(),{passive:false});
+  $('touchGrid').append(b);
+}
+function showControls(){
+  $('setup').hidden=true;$('disconnect').hidden=false;$('roleLabel').hidden=false;
+  $('roleLabel').textContent=selectedRole.toUpperCase();$('touchGrid').replaceChildren();
+  if(selectedRole==='steer'){addButton('◀ LEFT','left');addButton('RIGHT ▶','right');}
+  if(selectedRole==='pedals'){addButton('↑ GAS','gas');addButton('↓ REVERSE','reverse');}
+  if(selectedRole==='boost')addButton('⚡ BOOST','boost',true);
+  if(selectedRole==='horn')addButton('📣 HONK','horn',true);
+  $('controls').classList.add('ready');
+  sendState();
+}
+function claimChosenRole(){
+  if(!conn?.open||owned||claimPending)return;
+  const requested=$('role').value;
+  if(!VALID_ROLES.includes(requested))return;
+  if(roleAvailability&&roleAvailability[requested]!==true){
+    status(`${ROLE_NAMES[requested]} is taken. Select a free role.`);return;
+  }
+  selectedRole=requested;claimPending=true;
+  status(`Requesting ${ROLE_NAMES[selectedRole]}…`);
+  try{conn.send({type:'hello',role:selectedRole});}catch{claimPending=false;status('Unable to request role.');}
+}
+function onMessage(data){
+  if(!data||typeof data!=='object')return;
+  if(data.type==='ready'){
+    // Remember the player's choice before disabling taken options. Never auto-assign.
+    const requested=$('role').value;
+    updateAvailability(data.roles);
+    if(roleAvailability?.[requested]!==true){
+      status(`${ROLE_NAMES[requested]} is taken. Please choose a free role.`);
+    }else{
+      status('Connected to room. Checking role…');
+      claimChosenRole();
+    }
+  }
+  if(data.type==='roles')updateAvailability(data.roles);
+  if(data.type==='accepted'&&data.role===selectedRole){
+    claimPending=false;owned=true;showControls();status(`Connected · ${ROLE_NAMES[selectedRole]}`);
+  }
+  if(data.type==='rejected'){
+    claimPending=false;
+    if(data.roles)updateAvailability(data.roles);
+    status(data.reason||'Role unavailable. Pick another role.');
+    if(!conn?.open||/room full/i.test(data.reason||''))closeConnectionWithMessage(data.reason);
+    else $('join').textContent='Claim selected role';
+  }
+  if(data.type==='timeout'){closeConnectionWithMessage('Connection timed out. Reconnect to claim a free role.');}
+  if(data.type==='ping'&&conn?.open){try{conn.send({type:'pong',seq:data.seq});}catch{}}
+}
+function closeConnectionWithMessage(message){closeConnection();status(message);}
+function connectToRoom(room){
+  if(typeof window.Peer!=='function'){status('PeerJS unavailable. Check your internet.');return;}
+  connecting=true;connectedRoom=room;status('Connecting…');$('join').disabled=true;
+  try{
+    peer=new Peer(undefined,{debug:0});
+    peer.on('open',()=>{
+      conn=peer.connect('squirrelcar-j-'+room.toLowerCase(),{reliable:true,serialization:'json'});
+      conn.on('open',()=>{
+        connecting=false;$('join').disabled=false;$('join').textContent='Claim selected role';
+        $('disconnect').hidden=false;
+        status('Connected. Waiting for available roles…');
+        // Heartbeat even before a role is claimed: the host must not time us out
+        // while a player chooses a different available role.
+        timer=setInterval(()=>{
+          if(!conn?.open)return;
+          try{conn.send({type:'heartbeat'});}catch{}
+          sendState();
+        },100);
+      });
+      conn.on('data',onMessage);
+      conn.on('close',()=>closeConnectionWithMessage('Disconnected. Connect again to reclaim a free role.'));
+      conn.on('error',()=>closeConnectionWithMessage('Connection failed. Check the room code and network.'));
+    });
+    peer.on('error',e=>closeConnectionWithMessage('Connection error: '+(e?.type||'network')));
+  }catch(e){closeConnectionWithMessage('Unable to connect: '+String(e.message||e));}
+}
+$('join').addEventListener('click',()=>{
+  const room=$('room').value.toUpperCase().trim();
+  if(!/^[A-HJ-NP-Z2-9]{6}$/.test(room)){status('Enter a valid six-character room code.');return;}
+  if(conn?.open){
+    if(room!==connectedRoom){status('Disconnect before changing the room code.');return;}
+    claimChosenRole();return;
+  }
+  if(connecting)return;
+  connectToRoom(room);
+});
+$('disconnect').addEventListener('click',closeConnection);
+addEventListener('blur',clearTouches);
+addEventListener('pagehide',closeConnection);
+$('controls').addEventListener('dblclick',e=>e.preventDefault());
+$('controls').addEventListener('gesturestart',e=>e.preventDefault(),{passive:false});
+addEventListener('contextmenu',e=>e.preventDefault());
+addEventListener('touchmove',e=>e.preventDefault(),{passive:false});
+</script>
+</body>
+</html>
